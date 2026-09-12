@@ -162,6 +162,29 @@ The default remains `"codex-auto-review"`; explicit model IDs and
 The bare value `"current"` is reserved for this mode; use `"provider/current"`
 to select a model whose ID is literally `current`.
 
+To make several trusted reviewer models selectable, configure named profiles
+and choose the startup profile with `reviewer`:
+
+```json
+{
+  "reviewer": "terra",
+  "reviewers": {
+    "sonnet": {
+      "model": "claude-bridge/claude-sonnet-4-6",
+      "reasoning": "off"
+    },
+    "terra": {
+      "model": "openai-codex/gpt-5.6-terra",
+      "reasoning": "off"
+    }
+  }
+}
+```
+
+In interactive TUI sessions, `/auto-review-model` selects among these trusted
+profiles for the remainder of the current session. The selection is not
+persisted and projects cannot define profiles or select one.
+
 For a complete `@gotgenes/pi-permission-system` config that wires
 `pi-auto-review` into the authorizer chain — a copyable baseline covering
 read/write/edit, a read-only bash allowlist, MCP tool access, and a
@@ -185,6 +208,7 @@ Package defaults:
 {
   "model": "codex-auto-review",
   "reasoning": "low",
+  "reviewers": {},
   "timeoutMs": 90000,
   "maxTokens": 256,
   "retries": 2,
