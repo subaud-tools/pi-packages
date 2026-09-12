@@ -16,10 +16,17 @@ export type ReasoningLevel =
 
 export type BoundedSurface = "external_directory" | "path";
 
+export type ReviewerProfile = Readonly<{
+  model: string;
+  reasoning: ReasoningLevel;
+}>;
+
 export type Config = {
   /** Model id, provider/model, or "current" for the live Pi session model. */
   model: string;
   reasoning: ReasoningLevel;
+  reviewer?: string;
+  reviewers?: Readonly<Record<string, ReviewerProfile>>;
   timeoutMs: number;
   maxTokens: number;
   retries: number;
