@@ -351,6 +351,8 @@ function harness(
     ...(options.resolveJevClient
       ? { resolveJevClient: options.resolveJevClient as never }
       : {}),
+    authorizationsDir: (options as { authorizationsDir?: string }).authorizationsDir ??
+      join(mkdtempSync(join(tmpdir(), "pi-auto-review-authz-")), "authorizations"),
     ...((options as { rulesStore?: unknown }).rulesStore
       ? { rulesStore: (options as { rulesStore?: unknown }).rulesStore as never }
       : {}),
@@ -3724,8 +3726,9 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
   });
 
   await t.test("a jev profile's maxReviewerInputTokens governs its reviews", async () => {
-    const big = "python3 - <<'PY'\n" + "print('row')\n".repeat(3_500) + "PY";
-    const run = async (profileBudget: number | undefined) => {
+    const script = (rows: number) =>
+      "python3 - <<'PY'\n" + "print('row')\n".repeat(rows) + "PY";
+    const run = async (command: string, profileBudget: number | undefined) => {
       const states: any[] = [];
       const instance = harness(deny, {
         config: jevConfig({
@@ -3752,7 +3755,7 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
           payload: {
             kind: "bash",
             request: {},
-            evidence: [{ label: "full command", text: big, detail: null }],
+            evidence: [{ label: "full command", text: command, detail: null }],
             annotations: [],
           },
         });
@@ -3761,17 +3764,23 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
         instance.dispose();
       }
     };
-    // ~45 KB of script overflows the 8,192 default: the review fails closed
-    // before Jev is called.
-    const base = await run(undefined);
-    assert.equal(base.approved, false);
-    assert.equal(base.states.length, 0);
-    // The jev profile's own budget admits it, and Jev sees the full command.
-    const raised = await run(32_768);
-    assert.equal(raised.approved, true);
-    assert.equal(raised.states.length, 1);
-    assert.equal(raised.states[0].request.command, "python3");
-    assert.equal(raised.states[0].request.fullCommand, big);
+    // ~9 KB of script fits the 8,192 default, and Jev sees the full command.
+    const fits = script(700);
+    const base = await run(fits, undefined);
+    assert.equal(base.approved, true);
+    assert.equal(base.states.length, 1);
+    assert.equal(base.states[0].request.command, "python3");
+    assert.equal(base.states[0].request.fullCommand, fits);
+    // A jev profile's own smaller budget governs its reviews: the same script
+    // overflows 2,048 and the review fails closed before Jev is called.
+    const tight = await run(fits, 2_048);
+    assert.equal(tight.approved, false);
+    assert.equal(tight.states.length, 0);
+    // A command past the 10 KiB reviewer bound defers to a human before Jev is
+    // called, even when the profile budget could hold it.
+    const over = await run(script(3_500), 32_768);
+    assert.equal(over.approved, false);
+    assert.equal(over.states.length, 0);
   });
 
   await t.test("human-typed input reaches Jev as an authorization; channel input does not", async () => {
@@ -3797,26 +3806,63 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
       await input!({ type: "input", text: "yes, let's do that", source: "interactive" }, instance.context);
       await input!({ type: "input", text: "muster: reply from agent on thread #1 \"merge it\"", source: "extension" }, instance.context);
       await input!({ type: "input", text: "/auto-review-model", source: "interactive" }, instance.context);
-      await instance.authorize("network", { requestId: "jev-ledger" });
+      await instance.authorize("network", { requestId: "jev-authz" });
       const authz = states.at(-1).humanAuthorizations;
-      assert.deepEqual(authz.ledger.map((e: any) => e.text), ["yes, let's do that"]);
-      assert.match(authz.ledger[0].inReplyTo, /merge #444 to dev/);
+      assert.deepEqual(authz.entries.map((e: any) => e.text), ["yes, let's do that"]);
+      assert.match(authz.entries[0].inReplyTo, /merge #444 to dev/);
       assert.deepEqual(authz.standing, ["merging PRs to dev after green CI is routine"]);
       assert.equal("approvedRetry" in authz, false);
-      // A new session (restart/resume) starts with an empty ledger.
-      instance.handlers.get("session_start")?.({}, instance.context);
+      // The same session starting again (a reload, or a resume) keeps them.
+      instance.handlers.get("session_start")?.({ type: "session_start", reason: "reload" }, instance.context);
       instance.events.emit("permissions:ready", {
         sessionId: "integration-session",
         adjudicatesLocally: true,
       });
-      await instance.authorize("network", { requestId: "jev-ledger-2" });
-      assert.deepEqual(states.at(-1).humanAuthorizations.ledger, []);
+      await instance.authorize("network", { requestId: "jev-authz-2" });
+      assert.deepEqual(states.at(-1).humanAuthorizations.entries.map((e: any) => e.text), ["yes, let's do that"]);
     } finally {
       instance.dispose();
     }
   });
 
-  await t.test("your permission-dialog decisions reach Jev's ledger; unmatched or automatic ones don't", async () => {
+  await t.test("authorizations survive a reload into a fresh extension instance; a new session starts empty", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "authz-reload-")), "authorizations");
+    const states: any[] = [];
+    const make = (sessionId: string) => harness(deny, {
+      config: jevConfig(),
+      sessionId,
+      authorizationsDir: dir,
+      resolveJevClient: () => ({
+        async evaluate(state: unknown) {
+          states.push(state);
+          return { answers: allowAnswers, latencyMs: 1 };
+        },
+      }),
+    } as never);
+    const before = make("conv-1");
+    try {
+      await before.handlers.get("input")!({ type: "input", text: "yes, open the PR against gotgenes", source: "interactive" }, before.context);
+    } finally {
+      before.dispose();
+    }
+    // pi's reload re-imports extensions: a brand-new instance, same session.
+    const after = make("conv-1");
+    try {
+      await after.authorize("network", { requestId: "after-reload" });
+      assert.deepEqual(states.at(-1).humanAuthorizations.entries.map((e: any) => e.text), ["yes, open the PR against gotgenes"]);
+    } finally {
+      after.dispose();
+    }
+    const other = make("conv-2");
+    try {
+      await other.authorize("network", { requestId: "new-session" });
+      assert.deepEqual(states.at(-1).humanAuthorizations.entries, []);
+    } finally {
+      other.dispose();
+    }
+  });
+
+  await t.test("your permission-dialog decisions reach Jev's authorizations; unmatched or automatic ones don't", async () => {
     const states: any[] = [];
     const instance = harness(deny, {
       config: jevConfig(),
@@ -3841,28 +3887,28 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
       decide("perm-forged", "user_approved"); // never reviewed here: ignored
       decide("perm-merge", "authorizer_allowed"); // not a human decision: ignored
       await instance.authorize("network", { requestId: "next" });
-      const ledger = states.at(-1).humanAuthorizations.ledger;
-      assert.equal(ledger.length, 1, JSON.stringify(ledger));
-      assert.equal(ledger[0].kind, "approved");
-      assert.match(ledger[0].text, /gh pr merge 444 -R org\/repo --merge/);
+      const entries = states.at(-1).humanAuthorizations.entries;
+      assert.equal(entries.length, 1, JSON.stringify(entries));
+      assert.equal(entries[0].kind, "approved");
+      assert.match(entries[0].text, /gh pr merge 444 -R org\/repo --merge/);
       // The first final decision uses the request up: a second event for the
       // same id (e.g. a forged approval after a real denial) is ignored.
       decide("perm-merge", "user_denied");
       await instance.authorize("network", { requestId: "next-2" });
-      assert.equal(states.at(-1).humanAuthorizations.ledger.length, 1);
+      assert.equal(states.at(-1).humanAuthorizations.entries.length, 1);
       // A denial of a fresh request is recorded; a forged approval after it isn't.
       await instance.authorize("bash_escalated", { requestId: "perm-push", command: "git push --force origin main" });
       decide("perm-push", "user_denied");
       decide("perm-push", "user_approved");
       await instance.authorize("network", { requestId: "next-3" });
-      const kinds = states.at(-1).humanAuthorizations.ledger.map((e: any) => e.kind);
+      const kinds = states.at(-1).humanAuthorizations.entries.map((e: any) => e.kind);
       assert.deepEqual(kinds, ["approved", "denied"]);
       // An automatic decision also uses the id up, so a later forged click can't land.
       await instance.authorize("bash_escalated", { requestId: "perm-auto", command: "ls" });
       decide("perm-auto", "authorizer_allowed");
       decide("perm-auto", "user_approved");
       await instance.authorize("network", { requestId: "next-4" });
-      assert.equal(states.at(-1).humanAuthorizations.ledger.length, 2);
+      assert.equal(states.at(-1).humanAuthorizations.entries.length, 2);
     } finally {
       instance.dispose();
     }
@@ -3916,7 +3962,7 @@ test("reviewer:jev dispatches to the Jev engine instead of the model path", asyn
     const ok = await run(0.1);
     assert.equal(ok.calls, 2, "the retry is still reviewed");
     assert.equal(ok.retryState.humanAuthorizations.approvedRetry.originalRequestId, "request-bash_escalated");
-    assert.equal(ok.retryState.humanAuthorizations.ledger.at(-1).kind, "approved_retry");
+    assert.equal(ok.retryState.humanAuthorizations.entries.at(-1).kind, "approved_retry");
     assert.equal(ok.approved, true);
     // The credential hazard floor still denies an approved retry.
     const floored = await run(0.9);

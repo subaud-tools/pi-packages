@@ -228,8 +228,9 @@ reviewer, selected at startup with `reviewer` or in-session with
 - **Per-profile input budget.** Any profile may set `maxReviewerInputTokens`
   (2,048–32,768) to override the base budget for the reviews it runs. Jev charges
   only for input, at a low rate, and stays sub-second up to its ~32k-token state
-  limit, so a Jev profile can afford `32768` and review large commands whole
-  instead of failing closed on them.
+  limit, so a Jev profile can afford `32768` and review large commands with
+  their context instead of failing closed on the budget. A single command fact
+  over the 10 KiB reviewer bound still defers to a human.
 - **Risk is judged by consequence, not by kind of action.** The rubric assumes
   development in git repositories and infrastructure-as-code with a dev-to-prod
   pipeline, where changes inside the developer's own accounts can be rolled
@@ -263,13 +264,18 @@ reviewer, selected at startup with `reviewer` or in-session with
   retry, which is newer, still goes through. The hard floors deny first either
   way.
 - **Human authorization.** Jev honors what the human actually authorized:
-  - An **authorization ledger** records what the human types this session
+  - **Authorizations** record what the human types in this conversation
     (`interactive` input only; slash commands, `!` escapes, channel and muster
     deliveries, and this extension's own retry messages are excluded), each
-    with the assistant text it answered. So "yes, go ahead with the plan" from
-    a long planning session still counts after compaction or behind a stream
-    of channel notifications. It lives in memory only and is cleared on
-    `session_start`: a restart means authorizing again.
+    with the assistant text it answered, plus their permission decisions
+    (dialog Yes/No, `/auto-review-approve`, break-glass). So "yes, go ahead
+    with the plan" from a long planning session still counts after compaction
+    or behind a stream of channel notifications. They are saved per session
+    in `~/.pi/agent/extensions/pi-auto-review/authorizations/<session-id>.json`
+    (0600, in the protected directory), so a reload (`/reload`, `kempt
+    update`, pi-auto-reload) or a resume of the same conversation keeps them;
+    a new or forked session starts empty. Entries expire after 24 hours, and
+    a file that doesn't validate is ignored.
   - **Standing authorizations** in the trusted user config cover routine
     work, optionally scoped to a directory. Project config cannot set them.
     A rule only helps when the command shows it applies ("after CI is green"
@@ -526,19 +532,6 @@ tool-call arguments collapse to an ID/name/reason linkage shell, while fields
 not represented by the request remain available as evidence. This compact
 reviewer representation does not affect request hashes, grants, overrides, or
 audit evidence.
-
-For bash, `@gotgenes/pi-permission-system` gates each unit of a command: for a
-heredoc such as `python3 - <<'PY' ...` the ask names only `python3` and carries
-the whole command as prompt-payload evidence labelled `full command`. The
-request keeps the gated unit in `command` and adds the whole command as
-`fullCommand`, which reviewers are told to judge. It is part of the canonical
-request, so it is never truncated: if it does not fit the input budget the
-review fails closed. The agent's own tool call carrying the same command
-collapses to its linkage shell, so the script is sent once, and `fullCommand`
-is part of the request hash, so an approval for one script never covers a
-different script behind the same gated unit. Without it, reviewers saw the
-script only as tool-call evidence cut to its first `maxToolTranscriptTokens`
-bytes, and a payload past that point went unseen.
 
 `maxReviewerInputTokens` covers the fixed policy, canonical request, override,
 evidence, omissions, JSON framing, and a 64-token provider-framing reserve. Its
