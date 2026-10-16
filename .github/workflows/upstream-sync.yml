@@ -1,0 +1,31 @@
+name: upstream-sync
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+    inputs:
+      force: { type: boolean, default: false, description: "Publish the current state even if already in sync" }
+      dry_run: { type: boolean, default: false, description: "Run rebase/test/build/pack end to end; publish, push and issue nothing" }
+      notify_test: { type: boolean, default: false, description: "Open and close a test issue to prove alerts reach you, then stop" }
+permissions: { contents: write, issues: write, id-token: write }
+concurrency: { group: upstream-sync, cancel-in-progress: false }
+jobs:
+  sync:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: schuettc/tools-actions/fork-sync@v0.10.3
+        with:
+          upstream_repo: "erichll/pi-packages"
+          upstream_branch: "main"
+          pkg_name: "@schuettc/pi-auto-review"
+          pkg_dir: "packages/pi-auto-review"
+          tag_prefix: "pi-auto-review-v"
+          test_cmd: "npm ci && npm run check -w packages/pi-auto-review && npm test -w packages/pi-auto-review"
+          # Also test on the newest LTS. Not "current" yet: on Node 26 the tests can't
+# run, because Node dropped the TypeScript transform mode the test harness uses
+# for pi-permission-system's .ts sources (parameter properties). The runtime is fine.
+          test_node_versions: "lts"
+          build_cmd: ""
+          force: ${{ inputs.force }}
+          dry_run: ${{ inputs.dry_run }}
+          notify_test: ${{ inputs.notify_test }}
