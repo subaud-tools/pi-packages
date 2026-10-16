@@ -162,6 +162,176 @@ The default remains `"codex-auto-review"`; explicit model IDs and
 The bare value `"current"` is reserved for this mode; use `"provider/current"`
 to select a model whose ID is literally `current`.
 
+To make several trusted reviewer models selectable, configure named profiles
+and choose the startup profile with `reviewer`:
+
+```json
+{
+  "reviewer": "terra",
+  "reviewers": {
+    "sonnet": {
+      "model": "claude-bridge/claude-sonnet-4-6",
+      "reasoning": "off"
+    },
+    "terra": {
+      "model": "openai-codex/gpt-5.6-terra",
+      "reasoning": "off"
+    }
+  }
+}
+```
+
+In interactive TUI sessions, `/auto-review-model` selects among these trusted
+profiles for the remainder of the current session. The selection is not
+persisted and projects cannot define profiles or select one.
+
+### The `jev` reviewer profile
+
+A reviewer profile may set `engine: "jev"` to run the boundary check through
+the Jev (System One) classifier from `pi-typesafe-ai` instead of a chat-model
+completion. It sees the same budgeted, explicitly untrusted evidence the model
+reviewer sees and maps a typed verdict (choice, risk score, and three hazard
+probes) to the same allow/deny/defer decision.
+
+```json
+{
+  "reviewer": "sonnet",
+  "reviewers": {
+    "sonnet": {
+      "model": "claude-bridge/claude-sonnet-4-6",
+      "reasoning": "off"
+    },
+    "jev": {
+      "model": "openai/gpt-5.6",
+      "reasoning": "off",
+      "engine": "jev"
+    }
+  }
+}
+```
+
+The `jev` engine ships off by default: the default reviewer stays `sonnet` (a
+regular model completion), and Jev runs only when a `jev` profile is the active
+reviewer, selected at startup with `reviewer` or in-session with
+`/auto-review-model`. Requirements and guarantees:
+
+- **Requires `pi-typesafe-ai`** plus a configured key. Set the key once with
+  `/typesafe setup`; the reviewer resolves credentials from the same TypeSafe
+  directory that command writes to, so no restart is needed.
+- **Fails closed.** Any client error, timeout, or malformed answer is wrapped
+  as a review failure and the session's `failureMode` (`deny` by default)
+  applies — Jev never fails open into an allow.
+- **The deterministic hard-rule floor still applies.** Hard denies (recursive
+  forced wipes of `/`, `~`, `$HOME`, protected-write denials, and the rest of
+  the deterministic layer) run before any engine and cannot be overridden by a
+  Jev allow, exactly as with the model reviewer.
+- **Per-profile input budget.** Any profile may set `maxReviewerInputTokens`
+  (2,048–32,768) to override the base budget for the reviews it runs. Jev charges
+  only for input, at a low rate, and stays sub-second up to its ~32k-token state
+  limit, so a Jev profile can afford `32768` and review large commands with
+  their context instead of failing closed on the budget. A single command fact
+  over the 10 KiB reviewer bound still defers to a human.
+- **Risk is judged by consequence, not by kind of action.** The rubric assumes
+  development in git repositories and infrastructure-as-code with a dev-to-prod
+  pipeline, where changes inside the developer's own accounts can be rolled
+  back. So pushing branches, opening and merging PRs, rerunning CI, deploying,
+  and creating or updating the developer's own cloud resources (including
+  "prod" and IAM changes made through IaC) are **routine**. **Consequential**
+  means public-facing or outside the developer's control:
+  - PRs, issues, comments or reviews on repositories owned by someone else
+    (the *target* repository decides, not the branch it comes from)
+  - posting publicly or messaging outside people, making something newly public
+  - force-pushing a default branch, deleting a whole repository, local
+    checkout or project folder
+  - irreversibly destroying data that can't be regenerated, and system-wide
+    machine configuration
+
+  Set the developer's own GitHub accounts in the trusted user config
+  (project config can't):
+
+  ```json
+  { "ownedAccounts": ["my-user", "my-org"] }
+  ```
+  Without it, every repository counts as someone else's.
+- **Routine work isn't held up by a wavering choice.** When the risk is
+  routine and every hazard is below 0.3, the review allows unless Jev
+  *confidently* (0.6 or more) defers, for example because a script's body isn't
+  shown. Missing or partial answers never take this path.
+- **A human "no" wins.** A `human_objection` question checks whether the human
+  told the agent not to do this, to stop or hold off, or denied the same
+  operation, with nothing later lifting it. At 0.5 or above the review defers,
+  even for routine or otherwise-authorized work. An `/auto-review-approve`
+  retry, which is newer, still goes through. The hard floors deny first either
+  way.
+- **Human authorization.** Jev honors what the human actually authorized:
+  - **Authorizations** record what the human types in this conversation
+    (`interactive` input only; slash commands, `!` escapes, channel and muster
+    deliveries, and this extension's own retry messages are excluded), each
+    with the assistant text it answered, plus their permission decisions
+    (dialog Yes/No, `/auto-review-approve`, break-glass). So "yes, go ahead
+    with the plan" from a long planning session still counts after compaction
+    or behind a stream of channel notifications. They are saved per session
+    in `~/.pi/agent/extensions/pi-auto-review/authorizations/<session-id>.json`
+    (0600, in the protected directory), so a reload (`/reload`, `kempt
+    update`, pi-auto-reload) or a resume of the same conversation keeps them;
+    a new or forked session starts empty. Entries expire after 24 hours, and
+    a file that doesn't validate is ignored.
+  - **Standing authorizations** in the trusted user config cover routine
+    work, optionally scoped to a directory. Project config cannot set them.
+    A rule only helps when the command shows it applies ("after CI is green"
+    can't be checked from `gh pr merge 444`).
+
+    ```json
+    { "standingAuthorizations": [
+      { "scope": "~/GitHub/bettor-help-workspace",
+        "rule": "Kickstarting the help.bettor.dk-cache-* launchd jobs is routine." }
+    ] }
+    ```
+  - **`/auto-review-rules`** opens a panel with three tabs:
+    - **User:** rules for every project on this machine. Kempt rules are
+      listed here read-only.
+    - **Project:** rules for one git repository, including its linked
+      worktrees (a worktree maps to its main checkout).
+    - **Recent:** actions the reviewer deferred that you approved this
+      session. Enter drafts a rule from one, which you rewrite as the general
+      rule you mean.
+
+    Add, edit, turn on or off (space) and remove rules there. Every change
+    asks `y/N`. Rules are saved to
+    `~/.pi/agent/extensions/pi-auto-review/rules.json`, next to the
+    kempt-managed config (which `kempt update` never touches), and apply from
+    the next review. Project rules are stored there too, not in the
+    repository, because files in a repository are writable by the agent
+    working in it. Only Jev profiles read standing rules today; the panel
+    warns when the active reviewer is a model profile.
+  - A `user_authorization` question judges whether any of this covers the
+    exact operation, strictly by scope. At 0.55 or above, high risk is
+    allowed. The hazard floors (≥ 0.6) and critical risk still deny, and a
+    confident deny choice goes to a human instead.
+  - An **`/auto-review-approve` retry** is allowed unless a floor trips.
+  - The credential hazard means *exposing* credential material (reading,
+    printing, copying or sending a secret's value or a credential file). Using
+    ambient credentials or a named profile to call an API, naming a secret or
+    its ARN, listing secret names, and code that mentions credential-like
+    strings (such as a redaction list) are ordinary work that the risk score
+    judges instead.
+  - The decision log records each Jev signal (`jev`: risk, the three hazards,
+    choice confidence, authorization) and, when a review is unavailable, the
+    error class and HTTP status (`jevError`).
+  - **A deterministic floor for common reviewer-file writes.** A shell
+    command whose write (redirect, `tee`, `cp`/`rsync` destination, `mv`, `ln`,
+    `rm`, `sed -i`, SQLite writes, or file-writing code in a heredoc) targets
+    `~/.pi/agent/extensions/pi-auto-review` or the installed package is
+    hard-denied before any reviewer runs. It's best effort: shell is too
+    flexible to parse completely (`bash -c` strings, paths assembled from
+    variables, globs, `git` or `npm` run inside the directory), and those
+    forms still go to the reviewer, whose control-tampering hazard judges
+    them. Reading these files is fine. Change them through kempt or
+    `/auto-review-rules`.
+  - Injecting keystrokes into a terminal or pane (`tmux send-keys`,
+    `paste-buffer`, `load-buffer`) counts as control tampering, since injected
+    keys would look like human input.
+
 For a complete `@gotgenes/pi-permission-system` config that wires
 `pi-auto-review` into the authorizer chain — a copyable baseline covering
 read/write/edit, a read-only bash allowlist, MCP tool access, and a
@@ -185,6 +355,7 @@ Package defaults:
 {
   "model": "codex-auto-review",
   "reasoning": "low",
+  "reviewers": {},
   "timeoutMs": 90000,
   "maxTokens": 256,
   "retries": 2,
@@ -365,7 +536,11 @@ audit evidence.
 `maxReviewerInputTokens` covers the fixed policy, canonical request, override,
 evidence, omissions, JSON framing, and a 64-token provider-framing reserve. Its
 legal range is 2,048–32,768. Because no matching tokenizer is bundled, the
-`conservative:utf8` estimator counts every UTF-8 byte as one token.
+`conservative:cjk-aware` estimator counts one token per CJK code point and one
+per three UTF-8 bytes otherwise. The per-section transcript caps
+(`maxUserTranscriptTokens`, `maxToolTranscriptTokens`,
+`maxRelevantResultTokens`) are enforced in UTF-8 bytes and keep the start of
+each item.
 
 When over budget, the host removes secondary reasons, older structured tool
 matches, then optional producer/result units, re-estimating after each step. It
@@ -485,7 +660,10 @@ an input to this audit and supplies no RTK token or parsing metrics.
 ## Telemetry
 
 Every actual model call emits an internal `review_attempt`; each approval emits
-one `review_complete`. Events contain stable status/error classes, timings,
+one `review_complete`. Each `review_complete` carries an `engine` field
+(`"model"` or `"jev"`); a `jev` review additionally reports the compact Jev
+signal (`jev.risk`, `jev.haz`, and `jev.conf`) so policy-audit sweeps can
+capture it. Events contain stable status/error classes, timings,
 usage counters, evidence metadata, and prompt-part counts. They do not contain
 prompt or response text, provider errors, credentials, headers, or URL query
 values. Usage is marked `unknown_provenance` when pi-ai cannot distinguish

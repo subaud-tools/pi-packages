@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import type {
@@ -63,6 +65,8 @@ export { parseHostPort };
 import {
   applyUserConfig,
   complete,
+  reviewWithJev,
+  resolveJevClient,
   completeTelemetry,
   currentTurnScope,
   denialLabel,
@@ -71,10 +75,14 @@ import {
   modelDecisionToBoundaryReview,
   noModelSummary,
   protectedWriteHardDeny,
+  reviewerTamperingHardDeny,
   boundaryRequest,
   boundedRequest,
   resolveReviewerMeta,
+  activeReviewConfig,
+  selectReviewerProfile,
   sessionConfig,
+  standingAuthorizationsFor,
   userReviewMetaFromResult,
   userConfigPath,
   validateConfig,
@@ -88,6 +96,20 @@ import {
   type ReviewerTelemetryEvent,
 } from "./review/index.ts";
 import { ReviewExecutionError } from "./review/index.ts";
+import {
+  Authorizations,
+  lastAssistantText,
+  shouldRecordInput,
+  type AuthorizationDecisionKind,
+} from "./review/authorizations.ts";
+import { localRulesFor, projectRootFor, RulesStore } from "./review/rules-store.ts";
+import { RULES_BOX_WIDTH, RulesPanel, type RecentApproval } from "./review/rules-panel.ts";
+import type { JevClient } from "pi-typesafe-ai";
+
+export type ResolveJevClient = (profile: {
+  model: string;
+  timeoutMs?: number;
+}) => Pick<JevClient, "evaluate">;
 
 export {
   applyProjectConfig,
@@ -97,6 +119,7 @@ export {
   loadConfig,
   loadTrustedConfig,
   packageConfigPath,
+  selectReviewerProfile,
   userConfigPath,
   LOCAL_HARD_DENY_AGENT_INSTRUCTION,
   REVIEWER_CRITICAL_DENY_AGENT_INSTRUCTION,
@@ -108,6 +131,14 @@ export {
 export type PiAutoReviewExtensionOptions = {
   config?: Config;
   allowUntrustedWorkspace?: boolean;
+  // Injection seam for the Jev engine: tests supply a fake client here so the
+  // reviewer:jev dispatch path can be exercised without real credentials or a
+  // network call. Defaults to the real resolveJevClient.
+  resolveJevClient?: ResolveJevClient;
+  /** Injection seam for the panel's rules file; tests supply an in-memory store. */
+  rulesStore?: Pick<RulesStore, "load" | "save">;
+  /** Where each conversation's authorizations are saved; tests use a temp dir. */
+  authorizationsDir?: string;
 };
 
 const POLICY_AUDIT_ENTRY_TYPE = "pi-auto-review-policy-audit";
@@ -205,6 +236,7 @@ export function createPiAutoReviewExtension(
   const allowUntrustedWorkspace =
     options.allowUntrustedWorkspace === true ||
     process.env.PI_AUTO_REVIEW_ALLOW_UNTRUSTED_DEV === "1";
+  const resolveJevClientDep = options.resolveJevClient ?? resolveJevClient;
 
   return (pi: ExtensionAPI): void => {
   try {
@@ -221,6 +253,31 @@ export function createPiAutoReviewExtension(
   let shuttingDown = false;
   let disposeBrokerService: (() => void) | undefined;
   const reviewResults = new Map<string, ReviewResult>();
+  // What the human typed and decided in this conversation, saved per session
+  // so a reload or resume keeps it (see review/authorizations.ts).
+  const authorizations = new Authorizations({
+    dir: options.authorizationsDir ??
+      join(dirname(userConfigPath()), "authorizations"),
+  });
+  // Standing rules the human added with /auto-review-rules (rules.json).
+  const rulesStore = options.rulesStore ?? new RulesStore();
+  // Requests the reviewer deferred to the human, so an approval of one can
+  // be offered as a draft rule ("make actions like this routine?").
+  const deferredToHuman = new Map<string, { cwd: string; text: string }>();
+  // Newest first; the Recent tab of /auto-review-rules. Unseen until opened.
+  const recentApprovals: RecentApproval[] = [];
+  let recentUnseen = false;
+  // Requests this extension reviewed this session, by permission request id.
+  // A human decision on the bus is recorded in authorizations only when it names
+  // one of these, so an event emitted by any other extension (the bus is
+  // shared) cannot plant a fake approval.
+  const reviewedRequests = new Map<string, string>();
+  const MAX_REVIEWED_REQUESTS = 256;
+  const HUMAN_DECISIONS: Record<string, AuthorizationDecisionKind> = {
+    user_approved: "approved",
+    user_approved_for_session: "approved_for_session",
+    user_denied: "denied",
+  };
   const telemetryCompleted = new Set<string>();
   let broker: BoundaryApprovalBroker | undefined;
   // Reviewer metadata is re-resolved per review (see ReviewerMeta above),
@@ -291,24 +348,70 @@ export function createPiAutoReviewExtension(
     new BoundaryApprovalBroker({
       reviewer: async (request, reviewerContext) => {
         if (!context) throw new Error("review context is unavailable");
+        // Snapshot the reviewer config for this review. /auto-review-model may
+        // switch reviewers mid-turn; an in-flight review keeps the reviewer it
+        // started with (decision, failureMode, and telemetry all agree), and the
+        // switch takes effect from the next review. The active profile's input
+        // budget, when it sets one, applies to its own reviews.
+        const reviewConfig = activeReviewConfig(config);
+        // Branch on the active reviewer profile's engine. A jev profile runs
+        // the System One engine; every other profile keeps the model
+        // complete() path. Both produce a ReviewResult that flows through the
+        // identical success and fail-closed lines below. Resolved outside the
+        // try so the telemetry `engine` tag is correct on the failure path too.
+        const activeProfile =
+          reviewConfig.reviewer !== undefined
+            ? reviewConfig.reviewers?.[reviewConfig.reviewer]
+            : undefined;
+        const engine: "model" | "jev" =
+          activeProfile?.engine === "jev" ? "jev" : "model";
         try {
-          const result = await complete(
-            context,
-            config,
-            request,
-            reviewerContext,
-            resolveReviewerMeta,
-            emitTelemetry,
-          );
+          let result: Awaited<ReturnType<typeof complete>>;
+          if (activeProfile?.engine === "jev") {
+            // Recorded just before the client resolves so the Jev diagnostics
+            // can attribute time spent in client construction.
+            const dispatchStartedAt = Date.now();
+            result = await reviewWithJev(
+              context,
+              reviewConfig,
+              request,
+              reviewerContext,
+              activeProfile,
+              {
+                client: resolveJevClientDep(activeProfile),
+                dispatchStartedAt,
+                ownedAccounts: reviewConfig.ownedAccounts ?? [],
+                authorizations: {
+                  entries: authorizations.entries(),
+                  standing: [
+                    ...standingAuthorizationsFor(reviewConfig, request.cwd),
+                    ...localRulesFor(rulesStore.load().rules, request.cwd),
+                  ],
+                },
+              },
+            );
+          } else {
+            result = await complete(
+              context,
+              reviewConfig,
+              request,
+              reviewerContext,
+              resolveReviewerMeta,
+              emitTelemetry,
+            );
+          }
           if (request.source === "permission-system") {
             reviewResults.set(request.id, result);
           }
           emitTelemetry(
             completeTelemetry(
               request,
-              config,
+              reviewConfig,
               result.summary,
               result.decision.outcome,
+              undefined,
+              engine,
+              engine === "jev" ? result.jev : undefined,
             ),
           );
           telemetryCompleted.add(request.id);
@@ -320,7 +423,7 @@ export function createPiAutoReviewExtension(
           if (request.source === "permission-system") {
             reviewResults.set(request.id, {
               decision: {
-                outcome: config.failureMode,
+                outcome: reviewConfig.failureMode,
                 risk_level: "high",
                 user_authorization: "unknown",
                 rationale: "Automatic review is unavailable.",
@@ -338,10 +441,11 @@ export function createPiAutoReviewExtension(
           emitTelemetry(
             completeTelemetry(
               request,
-              config,
+              reviewConfig,
               execution.summary,
-              config.failureMode,
-              config.failureMode,
+              reviewConfig.failureMode,
+              reviewConfig.failureMode,
+              engine,
             ),
           );
           telemetryCompleted.add(request.id);
@@ -350,6 +454,7 @@ export function createPiAutoReviewExtension(
       },
       hardDeny: (request) =>
         protectedWriteHardDeny(request) ??
+        reviewerTamperingHardDeny(request.fullCommand ?? request.command) ??
         deterministicHardDeny({
           surface: "bash_escalated",
           command: request.command,
@@ -409,6 +514,93 @@ export function createPiAutoReviewExtension(
         }
       },
     });
+
+  pi.registerCommand("auto-review-rules", {
+    description: "Standing rules: routine work the reviewer treats as authorized",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify("/auto-review-rules requires the interactive pi TUI.", "warning");
+        return;
+      }
+      const openOnRecent = recentUnseen;
+      recentUnseen = false;
+      ctx.ui.setStatus("auto-review-rules", undefined);
+      const project = projectRootFor(ctx.cwd);
+      await ctx.ui.custom<void>(
+        (tui, theme, _keybindings, done) => new RulesPanel({
+          kemptRules: config.standingAuthorizations ?? [],
+          store: rulesStore,
+          ...(project ? { project } : {}),
+          recent: [...recentApprovals],
+          ...(openOnRecent ? { initialTab: "recent" as const } : {}),
+          ...(activeEngine(config) === "jev"
+            ? {}
+            : { inactiveReviewer: config.reviewer ?? config.model }),
+          session: ctx.sessionManager.getSessionId(),
+          theme,
+          requestRender: () => tui.requestRender(),
+          onClose: () => done(undefined),
+        }),
+        { overlay: true, overlayOptions: { anchor: "center", width: RULES_BOX_WIDTH } },
+      );
+    },
+  });
+
+  pi.registerCommand("auto-review-model", {
+    description: "Select a configured reviewer model for this session",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI || ctx.mode !== "tui") {
+        ctx.ui.notify(
+          "/auto-review-model requires interactive TUI mode.",
+          "warning",
+        );
+        return;
+      }
+      if (!context) {
+        ctx.ui.notify("pi-auto-review is not active.", "error");
+        return;
+      }
+      // No idle requirement: switching reviewers only affects reviews that start
+      // after the switch (each review snapshots its config), and only the human
+      // can run this command. /auto-review-approve and /auto-review-break-glass
+      // keep their idle guards because they bind a one-shot grant to one action.
+      const reviewers = config.reviewers ?? {};
+      const names = Object.keys(reviewers);
+      if (names.length === 0) {
+        ctx.ui.notify(
+          "No reviewer profiles are configured in the trusted user config.",
+          "info",
+        );
+        return;
+      }
+      const profiles = Object.entries(reviewers);
+      const choices = profiles.map(([name, profile]) => {
+        const current = name === config.reviewer ? " (current)" : "";
+        return `${name} — ${profile.model}${current}`;
+      });
+      const selected = await ctx.ui.select(
+        `Select auto-review model (current: ${config.reviewer ?? config.model})`,
+        choices,
+      );
+      if (!selected) return;
+      const index = choices.indexOf(selected);
+      if (index < 0) {
+        ctx.ui.notify("The selected reviewer is no longer available.", "error");
+        return;
+      }
+      const selectedProfile = profiles[index];
+      if (!selectedProfile) {
+        ctx.ui.notify("The selected reviewer is no longer available.", "error");
+        return;
+      }
+      const [reviewer] = selectedProfile;
+      config = selectReviewerProfile(config as Config, reviewer);
+      ctx.ui.notify(
+        `Using reviewer ${reviewer} (${config.model}) for the current session, starting with the next review.`,
+        "info",
+      );
+    },
+  });
 
   pi.registerCommand("auto-review-approve", {
     description:
@@ -472,6 +664,10 @@ export function createPiAutoReviewExtension(
         "Exact retry authorized once. The agent will retry it through the reviewer.",
         "info",
       );
+      authorizations.recordDecision({
+        kind: "approved_retry",
+        text: describeOperation(authorized.request),
+      });
       const target =
         authorized.request.resolvedPath ??
         authorized.request.path ??
@@ -571,6 +767,7 @@ export function createPiAutoReviewExtension(
           `Surface: ${request.surface}`,
           `Working directory: ${request.cwd}`,
           `Command/target: ${String(target).replace(/\s+/g, " ").slice(0, 300)}`,
+          ...fullCommandConfirmLines(request.fullCommand),
           `Request fingerprint: ${denial.requestHash.slice(0, 12)}`,
           "This authorizes only one exact retry and cannot override local hard-deny rules.",
         ].join("\n"),
@@ -613,6 +810,10 @@ export function createPiAutoReviewExtension(
         "Break-glass authorized once for the exact request; retry within 60 seconds.",
         "warning",
       );
+      authorizations.recordDecision({
+        kind: "break_glass",
+        text: describeOperation(authorized.request),
+      });
       const actionSummary = JSON.stringify({
         requestId: authorized.requestId,
         surface: authorized.request.surface,
@@ -630,6 +831,21 @@ export function createPiAutoReviewExtension(
     },
   });
 
+  // Record what the human types, with the assistant text it answers, so the
+  // Jev reviewer can honor a planning-session authorization after compaction
+  // or behind a stream of channel notifications.
+  pi.on("input", (event, ctx) => {
+    try {
+      if (!shouldRecordInput(event)) return;
+      authorizations.record({
+        text: event.text,
+        inReplyTo: lastAssistantText(ctx.sessionManager.buildContextEntries()),
+      });
+    } catch {
+      // Recording is best-effort; it must never block the human's input.
+    }
+  });
+
   pi.on("session_start", (_event, ctx) => {
     shuttingDown = false;
     registrationEpoch++;
@@ -641,6 +857,11 @@ export function createPiAutoReviewExtension(
     broker?.clear();
     reviewResults.clear();
     telemetryCompleted.clear();
+    authorizations.open(ctx.sessionManager.getSessionId());
+    reviewedRequests.clear();
+    deferredToHuman.clear();
+    recentApprovals.length = 0;
+    recentUnseen = false;
     uiAutoConfirmer.clear();
     try {
       config = sessionConfig(
@@ -693,6 +914,36 @@ export function createPiAutoReviewExtension(
   pi.events.on("permissions:decision", (event) => {
     reviewWidget.permissionDecision(event);
     policyAudit.record(event as PermissionDecisionLike);
+    try {
+      const decision = event as { requestId?: unknown; resolution?: unknown };
+      const kind = typeof decision.resolution === "string"
+        ? HUMAN_DECISIONS[decision.resolution]
+        : undefined;
+      if (typeof decision.requestId !== "string") return;
+      const deferred = deferredToHuman.get(decision.requestId);
+      deferredToHuman.delete(decision.requestId);
+      if (deferred && (kind === "approved" || kind === "approved_for_session")) {
+        const project = projectRootFor(deferred.cwd);
+        recentApprovals.unshift({
+          text: deferred.text.slice(0, 600),
+          ...(project ? { project } : {}),
+          at: new Date().toISOString(),
+        });
+        recentApprovals.length = Math.min(recentApprovals.length, 10);
+        recentUnseen = true;
+        context?.ui.setStatus(
+          "auto-review-rules",
+          "approved a deferred action · /auto-review-rules to make it routine",
+        );
+      }
+      const described = reviewedRequests.get(decision.requestId);
+      // One final decision per request: the first one (human or automatic)
+      // uses the id up, so a later event for the same id is ignored.
+      reviewedRequests.delete(decision.requestId);
+      if (kind && described) authorizations.recordDecision({ kind, text: described });
+    } catch {
+      // Recording is best-effort; it must never affect the decision itself.
+    }
   });
 
   pi.events.on("permissions:ready", (event) => {
@@ -752,19 +1003,34 @@ export function createPiAutoReviewExtension(
             return { kind: "deny", reason };
           }
 
+          // Same snapshot as the reviewer callback: this review is labelled with
+          // the reviewer that decided it even if /auto-review-model runs meanwhile.
+          const reviewConfig = config;
           const request = boundaryRequest(context, details, query);
+          reviewedRequests.delete(request.id);
+          reviewedRequests.set(request.id, describeOperation(request));
+          while (reviewedRequests.size > MAX_REVIEWED_REQUESTS) {
+            reviewedRequests.delete(reviewedRequests.keys().next().value!);
+          }
           const target = reviewTargetFromRequest(request);
           const reviewContext = context;
           const widgetGeneration = reviewWidget.begin(request.id, reviewContext, {
             surface,
             target,
-            model: config.model,
+            model: reviewConfig.model,
           });
           const decision = await broker.review(request, {
             sessionId: reviewContext.sessionManager.getSessionId(),
             scopeKey: currentTurnScope(reviewContext),
             issueGrant: false,
           });
+          if (decision.kind === "defer") {
+            deferredToHuman.set(request.id, { cwd: request.cwd, text: describeOperation(request) });
+            for (const oldest of deferredToHuman.keys()) {
+              if (deferredToHuman.size <= 64) break;
+              deferredToHuman.delete(oldest);
+            }
+          }
           const result = reviewResults.get(request.id);
           reviewResults.delete(request.id);
           const allowCapped =
@@ -789,7 +1055,7 @@ export function createPiAutoReviewExtension(
           } else {
             userOutcome = "deny";
           }
-          const reviewMeta = userReviewMetaFromResult(result, config.model);
+          const reviewMeta = userReviewMetaFromResult(result, reviewConfig.model);
           const noticeInput = {
             outcome: result?.unavailable ? "unavailable" as const : userOutcome,
             surface,
@@ -814,7 +1080,7 @@ export function createPiAutoReviewExtension(
             requestId: request.id,
             toolCallId: request.toolCallId,
             surface,
-            model: config.model,
+            model: reviewConfig.model,
             reviewerModel: reviewMeta.model,
             outcome: allowCapped ? "defer" : decision.kind,
             reviewerOutcome: decision.review.outcome,
@@ -838,7 +1104,25 @@ export function createPiAutoReviewExtension(
             transcriptRelevantResultCharacters:
               result?.transcript.relevantResultCharacters,
             transcriptTruncated: result?.transcript.truncated,
+            // Each Jev signal, so a floor or defer can be traced to its cause.
+            ...(result?.jev ? { jev: result.jev } : {}),
+            // Why a Jev review was unavailable: class and HTTP status only.
+            ...(result?.summary?.jevDiagnostics?.outcome === "error"
+              ? {
+                jevError: {
+                  errorClass: result.summary.jevDiagnostics.errorClass,
+                  ...(result.summary.jevDiagnostics.errorStatus !== undefined
+                    ? { errorStatus: result.summary.jevDiagnostics.errorStatus }
+                    : {}),
+                  // A bare class token only; never free text from an error.
+                  ...(/^\w{1,64}$/.test(result.summary.jevDiagnostics.errorName ?? "")
+                    ? { errorName: result.summary.jevDiagnostics.errorName }
+                    : {}),
+                },
+              }
+              : {}),
             command: request.command,
+            fullCommandCharacters: request.fullCommand?.length,
             path: request.path,
             resolvedPath: request.resolvedPath,
             destination: request.destination,
@@ -907,6 +1191,49 @@ export function createPiAutoReviewExtension(
     await policyAudit.close();
   });
   };
+}
+
+// What a decision entry says about the operation: the whole command
+// (not just the gated unit), else the tool's arguments or the path. For
+// non-bash tools the arguments are agent-authored, but they are what the
+// human saw in the dialog when deciding.
+function describeOperation(request: BoundaryRequest): string {
+  const target =
+    request.fullCommand ??
+    request.command ??
+    request.toolInputPreview ??
+    request.resolvedPath ??
+    request.path ??
+    request.destination ??
+    request.skillName ??
+    request.toolName ??
+    request.operation;
+  return `${request.surface}: ${String(target).replace(/\s+/g, " ")}`;
+}
+
+function activeEngine(config: Readonly<Config>): "jev" | "model" {
+  const profile = config.reviewer !== undefined ? config.reviewers?.[config.reviewer] : undefined;
+  return profile?.engine === "jev" ? "jev" : "model";
+}
+
+const BREAK_GLASS_FULL_COMMAND_CHARACTERS = 4_000;
+
+// Break-glass skips the reviewer, so the human is the last gate: show the
+// whole command they are authorizing (a heredoc's script, not just the gated
+// `python3`), and say so plainly when it is too long to show in full.
+function fullCommandConfirmLines(fullCommand: string | undefined): string[] {
+  if (fullCommand === undefined) return [];
+  const total = fullCommand.length;
+  const shown = fullCommand.slice(0, BREAK_GLASS_FULL_COMMAND_CHARACTERS);
+  return [
+    `Full command (${total} characters):`,
+    shown,
+    ...(total > shown.length
+      ? [
+          `Only the first ${BREAK_GLASS_FULL_COMMAND_CHARACTERS.toLocaleString("en-US")} of ${total.toLocaleString("en-US")} characters are shown; review the agent's tool call before confirming.`,
+        ]
+      : []),
+  ];
 }
 
 export default function piAutoReview(pi: ExtensionAPI): void {

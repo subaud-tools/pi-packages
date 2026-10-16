@@ -16,10 +16,21 @@ export type ReasoningLevel =
 
 export type BoundedSurface = "external_directory" | "path";
 
+export type ReviewerProfile = Readonly<{
+  model: string;
+  reasoning: ReasoningLevel;
+  engine?: "jev";
+  timeoutMs?: number;
+  /** Overrides the base maxReviewerInputTokens for reviews run by this profile. */
+  maxReviewerInputTokens?: number;
+}>;
+
 export type Config = {
   /** Model id, provider/model, or "current" for the live Pi session model. */
   model: string;
   reasoning: ReasoningLevel;
+  reviewer?: string;
+  reviewers?: Readonly<Record<string, ReviewerProfile>>;
   timeoutMs: number;
   maxTokens: number;
   retries: number;
@@ -32,7 +43,20 @@ export type Config = {
   grantTtlMs: number;
   autoConfirmBoundedAllows: readonly BoundedSurface[];
   policyAudit: Readonly<PolicyAuditConfig>;
+  /**
+   * Human-written standing authorizations for routine work (trusted user
+   * config only). A rule with a scope applies when the request cwd is inside it.
+   */
+  standingAuthorizations?: readonly Readonly<StandingAuthorization>[];
+  /**
+   * The developer's own GitHub accounts and orgs (trusted user config only).
+   * Work that targets these is routine for the Jev rubric; anything targeting
+   * another owner is public-facing.
+   */
+  ownedAccounts?: readonly string[];
 };
+
+export type StandingAuthorization = { scope?: string; rule: string };
 
 export type CompletionMessage = {
   stopReason?: string;
@@ -92,6 +116,7 @@ export type ReviewErrorClass =
   | "critical_evidence_overflow"
   | "required_profile_overflow"
   | "reviewer_input_budget_exceeded"
+  | "jev_error"
   | "unknown";
 
 export type ReviewAttemptObservation = {
@@ -122,12 +147,37 @@ export type ReviewPreflight = {
   total: PreflightPart;
 };
 
+export type JevStage = "clientResolve" | "transcript" | "preflight" | "keyCheck" | "evaluate" | "map";
+
+/** One undici diagnostics_channel event, relative to the review start. */
+export type JevNetEvent = { t: number; event: string; detail?: string };
+
+export type JevDiagnostics = {
+  /** ISO timestamp when reviewWithJev began (correlate with the UI). */
+  at: string;
+  /** Milliseconds spent per stage (only stages that ran). */
+  stages: Partial<Record<JevStage, number>>;
+  /** Whether a key resolved (only when the client exposes isConfigured). */
+  keyConfigured?: boolean;
+  outcome: "ok" | "error";
+  errorClass?: ReviewErrorClass;
+  errorName?: string;
+  errorStatus?: number;
+  /** Sanitized: bearer tokens / ts_ keys redacted, single line, <= 300 chars. */
+  errorMessage?: string;
+  /** Network events seen during evaluate (method/path/status/error code only). */
+  net?: JevNetEvent[];
+  /** HTTP environment the SDK inherits (detects a replaced fetch/dispatcher). */
+  httpEnv?: { dispatcher: string; fetchNative: boolean; fetchName: string };
+};
+
 export type ReviewExecutionSummary = {
   attempts: ReviewAttemptObservation[];
   errorCounts: Partial<Record<Exclude<ReviewErrorClass, "none">, number>>;
   durationMs: number;
   transcript: TranscriptResult;
   preflight: ReviewPreflight;
+  jevDiagnostics?: JevDiagnostics;
 };
 
 export type ReviewerTelemetryEvent =
@@ -140,10 +190,19 @@ export type ReviewerTelemetryEvent =
       type: "review_complete";
       requestId: string;
       surface: string;
+      engine: "model" | "jev";
       model: string;
       reasoning: ReasoningLevel;
       outcome: "allow" | "deny" | "defer";
       failureMode?: "deny" | "defer";
+      jev?: {
+        risk?: number;
+        haz?: { credential?: number; wipe?: number; control?: number };
+        conf?: number;
+        auth?: number;
+        objection?: number;
+      };
+      jevDiagnostics?: JevDiagnostics;
       attempts: number;
       errorCounts: ReviewExecutionSummary["errorCounts"];
       durationMs: number;
@@ -186,6 +245,12 @@ export type ReviewerRuntime = {
 // complete().
 export type ReviewerMeta = Omit<ReviewerRuntime, "auth" | "sessionId">;
 
+export type ReviewJevSignal = {
+  risk?: number;
+  haz?: { credential?: number; wipe?: number; control?: number };
+  conf?: number;
+};
+
 export type ReviewResult = {
   decision: ModelDecision;
   attempts: number;
@@ -194,6 +259,9 @@ export type ReviewResult = {
   transcript: TranscriptResult;
   summary: ReviewExecutionSummary;
   unavailable?: boolean;
+  // Present only for the jev engine: the compact verdict signal so the
+  // review_complete telemetry can capture it for policy-audit sweeps.
+  jev?: ReviewJevSignal;
 };
 
 export class ReviewExecutionError extends Error {

@@ -7,6 +7,9 @@ export {
   loadConfig,
   loadTrustedConfig,
   packageConfigPath,
+  activeReviewConfig,
+  standingAuthorizationsFor,
+  selectReviewerProfile,
   userConfigPath,
   validateConfig,
   DEFAULT_CONFIG,
@@ -24,6 +27,7 @@ export {
   assertTrustedInstallation,
   isWithin,
   protectedWriteHardDeny,
+  reviewerTamperingHardDeny,
 } from "./guards.ts";
 export {
   applyReviewerInputBudget,
@@ -48,10 +52,16 @@ export {
   denialLabel,
   modelDecisionToBoundaryReview,
 } from "./complete.ts";
+export {
+  reviewWithJev,
+  resolveJevClient,
+  type JevReviewDeps,
+} from "./jev-reviewer.ts";
 export type {
   BoundedSurface,
   Config,
   ReasoningLevel,
+  ReviewerProfile,
   ReviewErrorClass,
   ReviewExecutionSummary,
   ReviewPreflight,

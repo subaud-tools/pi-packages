@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BOUNDED_SURFACES,
@@ -10,12 +10,16 @@ import {
 import type {
   BoundedSurface,
   Config,
+  ReasoningLevel,
+  ReviewerProfile,
+  StandingAuthorization,
 } from "./types.ts";
 import type { PolicyAuditConfig } from "../policy-audit/index.ts";
 
 export const DEFAULT_CONFIG: Config = {
   model: "codex-auto-review",
   reasoning: "low",
+  reviewers: Object.freeze({}),
   timeoutMs: 90_000,
   maxTokens: 256,
   retries: 2,
@@ -39,6 +43,8 @@ export function validateConfig(value: unknown, source: string): Config {
   const allowedKeys = new Set([
     "model",
     "reasoning",
+    "reviewer",
+    "reviewers",
     "timeoutMs",
     "maxTokens",
     "retries",
@@ -51,6 +57,8 @@ export function validateConfig(value: unknown, source: string): Config {
     "grantTtlMs",
     "autoConfirmBoundedAllows",
     "policyAudit",
+    "standingAuthorizations",
+    "ownedAccounts",
   ]);
   const unknownKeys = Object.keys(raw).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length > 0) {
@@ -59,25 +67,127 @@ export function validateConfig(value: unknown, source: string): Config {
     );
   }
   const config = { ...DEFAULT_CONFIG, ...raw };
+  if (config.standingAuthorizations !== undefined) {
+    config.standingAuthorizations = validStandingAuthorizations(
+      config.standingAuthorizations,
+      source,
+    );
+  }
+  if (config.ownedAccounts !== undefined) {
+    const owners = config.ownedAccounts as unknown;
+    if (
+      !Array.isArray(owners) ||
+      owners.some((o) => typeof o !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(o))
+    ) {
+      throw new Error(`${EXTENSION_NAME}: ${source} ownedAccounts must be GitHub account names`);
+    }
+    config.ownedAccounts = Object.freeze([...new Set(owners as string[])]);
+  }
   config.policyAudit = {
     ...DEFAULT_CONFIG.policyAudit,
     ...(raw.policyAudit as Partial<PolicyAuditConfig> | undefined),
   };
-  if (
-    typeof config.model !== "string" ||
-    !config.model.trim() ||
-    /\s/.test(config.model) ||
-    config.model.split("/").some((segment) => !segment.trim())
-  ) {
+  const validModel = (model: unknown): model is string =>
+    typeof model === "string" &&
+    Boolean(model.trim()) &&
+    !/\s/.test(model) &&
+    model.split("/").every((segment) => Boolean(segment.trim()));
+  const validReasoning = (reasoning: unknown): reasoning is ReasoningLevel =>
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
+      String(reasoning),
+    );
+  if (!config.reviewers || typeof config.reviewers !== "object" ||
+      Array.isArray(config.reviewers)) {
+    throw new Error(`${EXTENSION_NAME}: reviewers must be an object`);
+  }
+  const reviewers = Object.create(null) as Record<string, ReviewerProfile>;
+  for (const [name, value] of Object.entries(config.reviewers)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+      throw new Error(`${EXTENSION_NAME}: invalid reviewer profile name ${name}`);
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`${EXTENSION_NAME}: reviewer profile ${name} must be an object`);
+    }
+    const profile = value as unknown as Record<string, unknown>;
+    const extra = Object.keys(profile).filter(
+      (key) =>
+        key !== "model" &&
+        key !== "reasoning" &&
+        key !== "engine" &&
+        key !== "timeoutMs" &&
+        key !== "maxReviewerInputTokens",
+    );
+    if (extra.length > 0) {
+      throw new Error(`${EXTENSION_NAME}: invalid reviewer profile ${name}`);
+    }
+    if (
+      profile.maxReviewerInputTokens !== undefined &&
+      (!Number.isInteger(profile.maxReviewerInputTokens) ||
+        (profile.maxReviewerInputTokens as number) < 2_048 ||
+        (profile.maxReviewerInputTokens as number) > 32_768)
+    ) {
+      throw new Error(`${EXTENSION_NAME}: invalid reviewer profile ${name}`);
+    }
+    const budget = profile.maxReviewerInputTokens !== undefined
+      ? { maxReviewerInputTokens: profile.maxReviewerInputTokens as number }
+      : {};
+    if (profile.engine === "jev") {
+      if (typeof profile.model !== "string" || !profile.model.trim()) {
+        throw new Error(`${EXTENSION_NAME}: invalid reviewer profile ${name}`);
+      }
+      if (
+        profile.timeoutMs !== undefined &&
+        (!Number.isInteger(profile.timeoutMs) ||
+          (profile.timeoutMs as number) < 1_000 ||
+          (profile.timeoutMs as number) > 60_000)
+      ) {
+        throw new Error(`${EXTENSION_NAME}: invalid reviewer profile ${name}`);
+      }
+      reviewers[name] = Object.freeze({
+        model: profile.model,
+        reasoning: (profile.reasoning === undefined
+          ? "off"
+          : profile.reasoning) as ReasoningLevel,
+        engine: "jev" as const,
+        ...(profile.timeoutMs !== undefined
+          ? { timeoutMs: profile.timeoutMs as number }
+          : {}),
+        ...budget,
+      });
+    } else {
+      if (
+        profile.engine !== undefined ||
+        profile.timeoutMs !== undefined ||
+        !validModel(profile.model) ||
+        !validReasoning(profile.reasoning)
+      ) {
+        throw new Error(`${EXTENSION_NAME}: invalid reviewer profile ${name}`);
+      }
+      reviewers[name] = Object.freeze({
+        model: profile.model,
+        reasoning: profile.reasoning,
+        ...budget,
+      });
+    }
+  }
+  config.reviewers = Object.freeze(reviewers);
+  if (config.reviewer !== undefined) {
+    const selected = typeof config.reviewer === "string" &&
+        Object.hasOwn(reviewers, config.reviewer)
+      ? reviewers[config.reviewer]
+      : undefined;
+    if (!selected) {
+      throw new Error(`${EXTENSION_NAME}: reviewer must name a configured profile`);
+    }
+    config.model = selected.model;
+    config.reasoning = selected.reasoning;
+  }
+  if (!validModel(config.model)) {
     throw new Error(
       `${EXTENSION_NAME}: model must be current, a model id, or provider/model`,
     );
   }
-  if (
-    !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
-      config.reasoning,
-    )
-  ) {
+  if (!validReasoning(config.reasoning)) {
     throw new Error(`${EXTENSION_NAME}: invalid reasoning level`);
   }
   if (
@@ -159,6 +269,7 @@ export function validateConfig(value: unknown, source: string): Config {
   }
   return {
     ...config,
+    reviewers: config.reviewers,
     autoConfirmBoundedAllows: Object.freeze([
       ...config.autoConfirmBoundedAllows,
     ]),
@@ -191,6 +302,77 @@ function readJsonConfig(path: string): unknown {
 export function loadConfig(): Config {
   const path = packageConfigPath();
   return validateConfig(readJsonConfig(path), path);
+}
+
+// The config a review runs with: the base config, with the active reviewer
+// profile's input budget when it sets one. Applied per review rather than at
+// selection time so switching profiles never loses the base budget.
+export function activeReviewConfig(config: Readonly<Config>): Readonly<Config> {
+  const profile = config.reviewer !== undefined
+    ? config.reviewers?.[config.reviewer]
+    : undefined;
+  return profile?.maxReviewerInputTokens !== undefined
+    ? Object.freeze({
+      ...config,
+      maxReviewerInputTokens: profile.maxReviewerInputTokens,
+    })
+    : config;
+}
+
+function validStandingAuthorizations(
+  value: unknown,
+  source: string,
+): readonly Readonly<StandingAuthorization>[] {
+  const invalid = () =>
+    new Error(`${EXTENSION_NAME}: ${source} standingAuthorizations must be [{ rule, scope? }]`);
+  if (!Array.isArray(value)) throw invalid();
+  return Object.freeze(value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw invalid();
+    const entry = item as Record<string, unknown>;
+    if (Object.keys(entry).some((key) => key !== "rule" && key !== "scope")) throw invalid();
+    if (typeof entry.rule !== "string" || !entry.rule.trim() || entry.rule.length > 1_000) {
+      throw invalid();
+    }
+    if (entry.scope !== undefined && (typeof entry.scope !== "string" || !entry.scope.trim())) {
+      throw invalid();
+    }
+    return Object.freeze({
+      rule: entry.rule.trim(),
+      ...(entry.scope !== undefined ? { scope: entry.scope.trim() } : {}),
+    });
+  }));
+}
+
+// Whether a rule scoped to `scope` (~ allowed) covers a request made from cwd.
+export function scopeCovers(scope: string | undefined, cwd: string): boolean {
+  if (scope === undefined || scope === "") return true;
+  // A relative scope would resolve against pi's own cwd, not the request's.
+  if (scope !== "~" && !scope.startsWith("~/") && !isAbsolute(scope)) return false;
+  const expanded = scope === "~" ? homedir() : scope.startsWith("~/") ? join(homedir(), scope.slice(2)) : scope;
+  const rel = relative(resolve(expanded), resolve(cwd));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+// The standing authorization rules that apply to a request made from cwd:
+// the kempt-managed ones in the user config, then any added in the panel.
+export function standingAuthorizationsFor(
+  config: Readonly<Config>,
+  cwd: string,
+  extra: readonly Readonly<StandingAuthorization>[] = [],
+): string[] {
+  return [...(config.standingAuthorizations ?? []), ...extra]
+    .filter((entry) => scopeCovers(entry.scope, cwd))
+    .map((entry) => entry.rule);
+}
+
+export function selectReviewerProfile(
+  config: Config,
+  reviewer: string,
+): Readonly<Config> {
+  return Object.freeze(validateConfig(
+    { ...config, reviewer },
+    `reviewer profile ${reviewer}`,
+  ));
 }
 
 /**
