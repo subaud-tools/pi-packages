@@ -62,7 +62,7 @@ export function assertTrustedInstallation(
 
 // The reviewer's own config, standing rules, audit data and installed code.
 const REVIEWER_PATH =
-  /\.pi\/agent\/extensions\/pi-auto-review(?![\w-])|node_modules\/@(?:schuettc|erichll)\/pi-auto-review(?![\w-])/i;
+  /\.pi\/agent\/extensions\/pi-auto-review(?![\w-])|node_modules\/@(?:schuettc|subaud-tools|erichll)\/pi-auto-review(?![\w-])/i;
 // Shell constructs that write, move, link or delete. Checked per command
 // segment, and only where that segment targets a reviewer path.
 // Redirects and tee write only to their target, handled separately.
