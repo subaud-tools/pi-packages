@@ -23,6 +23,8 @@ test("bash writes to the reviewer's config, rules or code are hard-denied", () =
     `node -e "require('fs').writeFileSync(process.env.HOME+'/.pi/agent/extensions/pi-auto-review/rules.json','{}')"`,
     `sqlite3 ${D}/policy-audit.sqlite "DELETE FROM decisions"`,
     `sed -i '' 's/0.55/0.1/' ~/.pi/agent/npm/node_modules/@schuettc/pi-auto-review/src/review/jev-reviewer.ts`,
+    `sed -i '' 's/0.55/0.1/' ~/.pi/agent/npm/node_modules/@subaud-tools/pi-auto-review/src/review/jev-reviewer.ts`,
+    `rm -rf ~/.pi/agent/npm/node_modules/@subaud-tools/pi-auto-review`,
   ]) {
     assert.equal(reviewerTamperingHardDeny(command)?.rule, "security-control-tampering", command);
   }
@@ -34,6 +36,7 @@ test("reading the reviewer's files, and unrelated writes, are not hard-denied", 
     `jq -c '{reviewer, jev: .reviewers.jev}' ${D}/config.json`,
     `jq -r .version ~/.pi/agent/npm/node_modules/@schuettc/pi-auto-review/package.json 2>/dev/null`,
     `sed -n '1,40p' ~/.pi/agent/npm/node_modules/@schuettc/pi-auto-review/src/index.ts`,
+    `sed -n '1,40p' ~/.pi/agent/npm/node_modules/@subaud-tools/pi-auto-review/src/index.ts`,
     `grep -rn jev ${D} 2>&1 | head`,
     `ls -la ${D}/ >&2`,
     `sqlite3 ${D}/policy-audit.sqlite "SELECT count(*) FROM decisions"`,
