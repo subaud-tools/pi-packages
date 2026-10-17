@@ -13,11 +13,11 @@ jobs:
   sync:
     runs-on: ubuntu-26.04
     steps:
-      - uses: schuettc/tools-actions/fork-sync@v0.10.3
+      - uses: subaud-tools/tools-actions/fork-sync@v0.11.0
         with:
           upstream_repo: "erichll/pi-packages"
           upstream_branch: "main"
-          pkg_name: "@schuettc/pi-auto-review"
+          pkg_name: "@subaud-tools/pi-auto-review"
           pkg_dir: "packages/pi-auto-review"
           tag_prefix: "pi-auto-review-v"
           test_cmd: "npm ci && npm run check -w packages/pi-auto-review && npm test -w packages/pi-auto-review"
